@@ -248,6 +248,7 @@ function smokeWanderProbe() {
           if (moved >= MOVE_THRESHOLD_PX) {
             clearInterval(poll);
             ipcRenderer.send("vcp1:smoke-wander", "ok");
+            smokeSleepProbe();
             return;
           }
         }
@@ -264,4 +265,243 @@ function readFollowerPos() {
   const el = document.getElementById("__vcp1_follower");
   const m = el && /translate\(\s*(-?[\d.]+)px,\s*(-?[\d.]+)px\)/.exec(el.style.transform || "");
   return m ? { x: parseFloat(m[1]), y: parseFloat(m[2]) } : null;
+}
+
+// The follower's on-screen box in this window's LOCAL coords. applyFrame()
+// paints `translate(x,y) translate(-50%,-50%) scale(s)` with width/height set
+// to the unscaled frame size, so the translate pair is the sprite's centre and
+// the visible half-extents are (size * scale) / 2 — the same box updateHover()
+// tests the cursor against in content.js.
+function readFollowerBox() {
+  const el = document.getElementById("__vcp1_follower");
+  if (!el) return null;
+  const t = el.style.transform || "";
+  const pos = /translate\(\s*(-?[\d.]+)px,\s*(-?[\d.]+)px\)/.exec(t);
+  if (!pos) return null;
+  const sc = /scale\(\s*([\d.]+)\s*\)/.exec(t);
+  const scale = sc ? parseFloat(sc[1]) : 1;
+  return {
+    cx: parseFloat(pos[1]),
+    cy: parseFloat(pos[2]),
+    halfW: ((parseFloat(el.style.width) || 0) * scale) / 2,
+    halfH: ((parseFloat(el.style.height) || 0) * scale) / 2
+  };
+}
+
+function readSheetName() {
+  const el = document.getElementById("__vcp1_follower");
+  const m = el && /([A-Za-z]+)-Anim\.webp/.exec(el.style.backgroundImage || "");
+  return m ? m[1] : "";
+}
+
+function globalOrigin() {
+  return (window.__VCP1_WORLD__ && window.__VCP1_WORLD__.origin) || { x: 0, y: 0 };
+}
+
+// --- idle-sleep probe: falling asleep must mean the *user* stopped moving the
+// mouse, and nothing else. Runs in wander mode (smokeWanderProbe leaves it
+// there) and dials wander's idle-sleep threshold down through the test hook,
+// since waiting out the real 30s isn't a smoke test. Asserts all three legs of
+// the contract: it stays awake while the cursor is being fed for well past
+// that threshold, it does fall asleep once the feed stops, and a single move
+// wakes it. The first leg is the regression guard for the removed random-nap
+// roll, which used to be able to put it to sleep with no idle time at all.
+const SLEEP_PROBE_IDLE_MS = 800;
+// How long leg 1 keeps the cursor moving. Sized to outlast a whole
+// roam -> pause -> post-pause-decision cycle, not just the dialed-down idle
+// threshold: a spontaneous sleep could only ever be rolled at the end of a
+// PAUSE, and reaching one costs a full roam traversal first (up to ~7s at the
+// default ~267px/s across a large display) plus the 2-8s pause itself. A
+// window merely longer than SLEEP_PROBE_IDLE_MS would usually expire mid-roam
+// and pass without ever exercising the decision this leg exists to police.
+// Backstop only — leg 1 normally ends on evidence (see SLEEP_PROBE_PAUSES).
+const SLEEP_PROBE_ACTIVE_MS = 25000;
+// How many completed pauses leg 1 waits for before it is satisfied. A
+// spontaneous sleep could only ever be rolled by choosePostPause(), which runs
+// at the end of a PAUSE, so watching the sprite go still at a waypoint and
+// then set off again twice proves that decision really executed. Deliberately
+// event-driven rather than a wall-clock window: pickRoamWaypoint() samples
+// across every connected display, so one roam traversal is as long as the
+// widest whole desktop, not the widest screen — any fixed duration tuned on a
+// single monitor would silently expire mid-roam on a multi-monitor machine and
+// pass without testing anything.
+const SLEEP_PROBE_PAUSES = 2;
+
+function smokeSleepProbe() {
+  const hooks = window.__VCP1_TEST_HOOKS__;
+  if (!hooks || typeof hooks.setWanderSleepTimeoutMs !== "function") {
+    ipcRenderer.send("vcp1:smoke-sleep", "fail:no-test-hook");
+    return;
+  }
+  // The shipped thresholds themselves: the legs below have to dial wander's
+  // down to run at all, so assert the real values first or they go untested.
+  // Both modes are meant to agree on "30s of no mouse movement".
+  const REQUIRED_SLEEP_MS = 30000;
+  const prod = hooks.productionSleepTimeouts ? hooks.productionSleepTimeouts() : null;
+  if (!prod || prod.follow !== REQUIRED_SLEEP_MS || prod.wander !== REQUIRED_SLEEP_MS) {
+    ipcRenderer.send("vcp1:smoke-sleep", `fail:threshold:${JSON.stringify(prod)}`);
+    return;
+  }
+  const restore = () => hooks.setWanderSleepTimeoutMs(0); // 0 -> back to the production threshold
+  // Leg 1's watcher can report a failure while leg 2's timer is still pending,
+  // so every exit goes through this once-only gate.
+  let finished = false;
+  const done = (result) => {
+    if (finished) return;
+    finished = true;
+    restore();
+    ipcRenderer.send("vcp1:smoke-sleep", result);
+    if (result === "ok") smokeHoverProbe();
+  };
+  hooks.setWanderSleepTimeoutMs(SLEEP_PROBE_IDLE_MS);
+
+  // Leg 1 — cursor active. The sprite roams wherever it likes, so this feed
+  // may well drift over it and set off a hover reaction; that plays hop or
+  // rotate, never sleep, so it can't turn this leg into a false pass.
+  let x = 40;
+  const feed = setInterval(() => {
+    x = x === 40 ? 46 : 40;
+    window.dispatchEvent(new MouseEvent("mousemove", { clientX: x, clientY: 40 }));
+  }, 60);
+  const watchAwake = setInterval(() => {
+    if (readSheetName() === "Sleep") {
+      clearInterval(feed);
+      clearInterval(watchAwake);
+      done("fail:slept-while-cursor-active");
+    }
+  }, 50);
+
+  // End leg 1 once the sprite has completed SLEEP_PROBE_PAUSES pauses — gone
+  // still at a waypoint, then set off again. A regression that naps instead of
+  // roaming on would stay still rather than setting off, so it never advances
+  // this count; watchAwake above is what catches that, and the wall-clock
+  // backstop keeps a genuinely stalled FSM from hanging the probe.
+  let pausesSeen = 0;
+  let wasStill = false;
+  let lastBox = readFollowerBox();
+  const legOneStart = Date.now();
+  const watchRoam = setInterval(() => {
+    const cur = readFollowerBox();
+    const still = !!(lastBox && cur &&
+      Math.abs(cur.cx - lastBox.cx) < 0.6 && Math.abs(cur.cy - lastBox.cy) < 0.6);
+    lastBox = cur;
+    if (wasStill && !still) pausesSeen++;
+    wasStill = still;
+    if (pausesSeen < SLEEP_PROBE_PAUSES && Date.now() - legOneStart < SLEEP_PROBE_ACTIVE_MS) return;
+    clearInterval(watchRoam);
+    clearInterval(feed);
+    clearInterval(watchAwake);
+    if (finished) return;
+    // Leg 2 — cursor idle. Generous deadline: an in-progress attack cycle
+    // blocks the sleep transition until it finishes (by design), and the
+    // animation switch itself waits out the current sheet cycle.
+    const sleepDeadline = Date.now() + SLEEP_PROBE_IDLE_MS + 4000;
+    const waitSleep = setInterval(() => {
+      if (readSheetName() === "Sleep") {
+        clearInterval(waitSleep);
+        // Leg 3 — one move must wake it. Restore the production threshold
+        // first, so it can't simply doze off again mid-measurement.
+        restore();
+        window.dispatchEvent(new MouseEvent("mousemove", { clientX: 200, clientY: 200 }));
+        const wakeDeadline = Date.now() + 2500;
+        const waitWake = setInterval(() => {
+          if (readSheetName() !== "Sleep") {
+            clearInterval(waitWake);
+            done("ok");
+          } else if (Date.now() > wakeDeadline) {
+            clearInterval(waitWake);
+            done("fail:no-wake");
+          }
+        }, 50);
+      } else if (Date.now() > sleepDeadline) {
+        clearInterval(waitSleep);
+        done(`fail:no-sleep:${readSheetName() || "none"}`);
+      }
+    }, 50);
+  }, 120);
+}
+
+// --- hover-reaction probe: placing the cursor on the sprite must produce a
+// pleased reaction (hop or rotate) and never the attack motion. Reads the
+// reaction the engine actually picked via the test hook rather than guessing
+// from the painted sheet — wander's own spontaneous attack roll paints
+// "attack" too, and a sheet read alone couldn't tell the two apart. Also
+// covers the failure mode that dropping "attack" from the pool could have
+// introduced: a pool matching none of the pack's states, leaving hover
+// silently doing nothing at all.
+const HOVER_PROBE_REACTIONS = 3;
+
+function smokeHoverProbe() {
+  const hooks = window.__VCP1_TEST_HOOKS__;
+  if (!hooks || typeof hooks.takeLastHoverReaction !== "function") {
+    ipcRenderer.send("vcp1:smoke-hover", "fail:no-test-hook");
+    return;
+  }
+  hooks.takeLastHoverReaction(); // drop anything an earlier probe's feed set off
+  const seen = [];
+  const deadline = Date.now() + 60000;
+
+  // Wait for the sprite to stand still (wander pauses 2-8s after every
+  // waypoint) before aiming at it — a roaming target can walk out from under
+  // the cursor between reading its box and dispatching the entry move.
+  function whenStill(cb) {
+    let last = readFollowerBox();
+    const stillDeadline = Date.now() + 12000;
+    const poll = setInterval(() => {
+      const cur = readFollowerBox();
+      if (last && cur && Math.abs(cur.cx - last.cx) < 0.6 && Math.abs(cur.cy - last.cy) < 0.6) {
+        clearInterval(poll);
+        cb(cur);
+        return;
+      }
+      last = cur;
+      if (Date.now() > stillDeadline) { clearInterval(poll); cb(null); }
+    }, 120);
+  }
+
+  function attempt() {
+    if (seen.length >= HOVER_PROBE_REACTIONS) {
+      ipcRenderer.send("vcp1:smoke-hover", "ok");
+      return;
+    }
+    if (Date.now() > deadline) {
+      ipcRenderer.send("vcp1:smoke-hover", `fail:only-${seen.length}-reactions:${seen.join(",") || "none"}`);
+      return;
+    }
+    whenStill((box) => {
+      if (!box) { attempt(); return; }
+      const origin = globalOrigin();
+      const gy = box.cy + origin.y;
+      const outside = box.cx + origin.x + box.halfW + 3;
+      // Cross the edge in one slow 6px step 100ms later: content.js only
+      // accepts an entry made slowly and just-moved (HOVER_MAX_SPEED_PXPS /
+      // HOVER_WARM_GAP_MS / HOVER_RECENCY_MS), which is what a deliberate
+      // hover looks like and a fast pass-through does not. 6px/100ms = 60px/s.
+      window.dispatchEvent(new MouseEvent("mousemove", { clientX: outside, clientY: gy }));
+      setTimeout(() => {
+        window.dispatchEvent(new MouseEvent("mousemove", { clientX: outside - 6, clientY: gy }));
+        const readDeadline = Date.now() + 800;
+        const poll = setInterval(() => {
+          const reaction = hooks.takeLastHoverReaction();
+          if (reaction) {
+            clearInterval(poll);
+            if (reaction !== "hop" && reaction !== "rotate") {
+              ipcRenderer.send("vcp1:smoke-hover", `fail:reaction:${reaction}`);
+              return;
+            }
+            seen.push(reaction);
+            // Leave the box and wait out the ~2s cooldown — content.js needs
+            // an exit and a re-entry on top of it before it will fire again.
+            window.dispatchEvent(new MouseEvent("mousemove", { clientX: 5, clientY: 5 }));
+            setTimeout(attempt, 2600);
+          } else if (Date.now() > readDeadline) {
+            clearInterval(poll);
+            window.dispatchEvent(new MouseEvent("mousemove", { clientX: 5, clientY: 5 }));
+            setTimeout(attempt, 300);
+          }
+        }, 25);
+      }, 100);
+    });
+  }
+  attempt();
 }

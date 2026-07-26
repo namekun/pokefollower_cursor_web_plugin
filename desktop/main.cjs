@@ -283,7 +283,7 @@ ipcMain.on("vcp1:snapshot", (_e, snap) => {
 
 const smokePassed = new Set();
 function requiredSmokeChecks() {
-  const base = ["overlay", "settings", "facing", "lang", "wander"];
+  const base = ["overlay", "settings", "facing", "lang", "wander", "sleep", "hover"];
   // A mirror window only exists (and only ever will broadcast "mirror") when
   // more than one display is connected — gating on it unconditionally would
   // hang single-display CI/dev runs forever.
@@ -336,6 +336,28 @@ ipcMain.on("vcp1:smoke-wander", (_e, result) => {
     app.exit(1);
   }
 });
+ipcMain.on("vcp1:smoke-sleep", (_e, result) => {
+  if (!SMOKE) return;
+  if (result === "ok") {
+    smokePassed.add("sleep");
+    console.log("SMOKE_SLEEP_OK");
+    smokeCheckDone();
+  } else {
+    console.error(`SMOKE_SLEEP_${result}`);
+    app.exit(1);
+  }
+});
+ipcMain.on("vcp1:smoke-hover", (_e, result) => {
+  if (!SMOKE) return;
+  if (result === "ok") {
+    smokePassed.add("hover");
+    console.log("SMOKE_HOVER_OK");
+    smokeCheckDone();
+  } else {
+    console.error(`SMOKE_HOVER_${result}`);
+    app.exit(1);
+  }
+});
 
 app.whenReady().then(() => {
   protocol.handle("poke", async (req) => {
@@ -375,9 +397,15 @@ app.whenReady().then(() => {
   if (!SMOKE && !NO_CURSOR_FEED) startCursorFeed();
 
   if (SMOKE) {
-    // facing (~7.9s) + wander (up to 10s backstop) run back-to-back in the
-    // overlay window, plus settings/lang in parallel — budget generously.
-    setTimeout(() => { console.error("SMOKE_TIMEOUT"); app.exit(1); }, 30000);
+    // facing (~8s) -> wander (up to 10s backstop) -> sleep (~23s worst case:
+    // a 16s cursor-active leg sized to outlast a full roam+pause cycle, then
+    // the idle and wake legs) -> hover (60s deadline; each of its 3 reactions
+    // waits for the sprite to stand still, which costs a roam traversal plus
+    // part of a 2-8s pause, then a 2.6s hover cooldown). These run
+    // back-to-back in the overlay window, with settings/lang in parallel.
+    // Budget generously — this is the whole chain's ceiling, not its
+    // expectation, which is nearer a minute.
+    setTimeout(() => { console.error("SMOKE_TIMEOUT"); app.exit(1); }, 150000);
   }
 });
 

@@ -21,18 +21,14 @@ whole desktop — over every app, not just the browser.
   that include a sleep animation).
 - **Wander mode** — the sprite roams the screen on its own, independent of the
   cursor. It walks to a random point, then rests for 2–8 seconds; during that
-  rest it has a 10% chance to nap (packs with a sleep state only) and a 15%
-  chance to play an attack motion in place (packs with an attack state only).
-  Follow mode falls asleep after just 30 seconds of no cursor movement, but
-  Wander mode uses a much longer idle timeout (5 minutes by default) so it
-  doesn't keep nodding off while you're simply watching it roam rather than
-  moving the cursor — it falls asleep right where it's standing once that
-  timeout passes (again, packs with a sleep animation only), and wakes the
-  instant the cursor moves again.
+  rest it has a 15% chance to play an attack motion in place (packs with an
+  attack state only). It never naps at random — in both modes the sprite only
+  falls asleep after the cursor has genuinely sat still for 30 seconds (packs
+  with a sleep animation only), and wakes the instant the cursor moves again.
 - **Hover reactions** — hold the cursor still over the sprite and it plays one
-  of a few reactions at random: a little hop, an in-place spin, or an attack
-  motion (whichever of those the pack actually has — hop and spin come up a
-  bit more often than attack). Passing over it quickly is deliberately
+  of two reactions at random: a little hop or an in-place spin (whichever of
+  those the pack actually has). It's a delighted reaction to being played
+  with, so no attack motion. Passing over it quickly is deliberately
   ignored, so a stray brush of the cursor never sets one off by accident.
   After a reaction there's about a 2-second cooldown, and the cursor has to
   leave the sprite and come back before it can trigger again. Hovering over
